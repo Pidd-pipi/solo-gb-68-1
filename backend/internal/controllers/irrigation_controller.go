@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"errors"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -23,17 +25,19 @@ func NewIrrigationController() *IrrigationController {
 
 // ManualIrrigate godoc
 // @Summary 手动灌溉
-// @Description 触发手动灌溉
+// @Description 触发手动灌溉。触发前检查区域用水预算：达到告警阈值时返回告警提醒；超过月度上限时拦截（409），不产生灌溉记录
 // @Tags 灌溉执行
 // @Security ApiKeyAuth
 // @Accept json
 // @Produce json
-// @Param zone_id body int true "区域ID"
+// @Param request body object{zone_id=int,estimated_usage=float64} true "区域ID与预估用水量（可选）"
 // @Success 200 {object} models.IrrigationLog
+// @Failure 409 {object} response.Response "超过用水预算上限"
 // @Router /api/irrigation/manual [post]
 func (c *IrrigationController) ManualIrrigate(ctx *gin.Context) {
 	var req struct {
-		ZoneID uint `json:"zone_id" binding:"required"`
+		ZoneID         uint    `json:"zone_id" binding:"required"`
+		EstimatedUsage float64 `json:"estimated_usage"`
 	}
 
 	if err := ctx.ShouldBindJSON(&req); err != nil {
@@ -41,8 +45,12 @@ func (c *IrrigationController) ManualIrrigate(ctx *gin.Context) {
 		return
 	}
 
-	log, err := c.irrigationService.StartIrrigation(nil, &req.ZoneID, models.TriggerTypeManual)
+	log, err := c.irrigationService.StartIrrigation(nil, &req.ZoneID, models.TriggerTypeManual, req.EstimatedUsage)
 	if err != nil {
+		if errors.Is(err, services.ErrBudgetExceeded) {
+			response.Error(ctx, http.StatusConflict, err.Error())
+			return
+		}
 		response.InternalServerError(ctx, err.Error())
 		return
 	}

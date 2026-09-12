@@ -85,6 +85,18 @@ func SetupRoutes(r *gin.Engine) {
 			irrigation.GET("/history", irrigationController.GetHistory)
 		}
 
+		budgets := api.Group("/budgets", middleware.JWTAuth())
+		{
+			budgetController := controllers.NewBudgetController()
+			budgets.GET("", budgetController.List)
+			budgets.GET("/:id", budgetController.Get)
+			budgets.GET("/:id/usage", budgetController.GetUsage)
+			budgets.POST("", budgetController.Create)
+			budgets.PUT("/:id", budgetController.Update)
+			budgets.POST("/:id/disable", budgetController.Disable)
+			budgets.POST("/:id/enable", budgetController.Enable)
+		}
+
 		statistics := api.Group("/statistics", middleware.JWTAuth())
 		{
 			irrigationController := controllers.NewIrrigationController()

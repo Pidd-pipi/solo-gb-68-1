@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ type IrrigationScheduler struct {
 	sensorService   *services.SensorService
 	deviceService  *services.DeviceService
 	alertService   *services.AlertService
+	budgetService  *services.BudgetService
 }
 
 func NewIrrigationScheduler() *IrrigationScheduler {
@@ -25,6 +27,7 @@ func NewIrrigationScheduler() *IrrigationScheduler {
 		sensorService:   services.NewSensorService(),
 		deviceService:  services.NewDeviceService(),
 		alertService:   services.NewAlertService(),
+		budgetService:  services.NewBudgetService(),
 	}
 }
 
@@ -33,6 +36,7 @@ func (s *IrrigationScheduler) Start() {
 
 	go s.runScheduleCheck()
 	go s.runDeviceHealthCheck()
+	go s.runReservationReaper()
 }
 
 func (s *IrrigationScheduler) runScheduleCheck() {
@@ -134,8 +138,18 @@ func (s *IrrigationScheduler) executeIrrigation(schedule models.IrrigationSchedu
 		triggerType = models.TriggerTypeConditional
 	}
 
-	log, err := s.irrigationService.StartIrrigation(&schedule.ID, schedule.ZoneID, triggerType)
+	// 预估用水量，与任务完成时的用水量估算口径一致（duration * 0.1）
+	estimatedUsage := float64(schedule.Duration) * 0.1
+
+	log, err := s.irrigationService.StartIrrigation(&schedule.ID, schedule.ZoneID, triggerType, estimatedUsage)
 	if err != nil {
+		if errors.Is(err, services.ErrBudgetExceeded) {
+			logger.Warn("Irrigation blocked by water budget",
+				zap.Uint("schedule_id", schedule.ID),
+				zap.Error(err),
+			)
+			return
+		}
 		logger.Error("Failed to start irrigation", zap.Error(err))
 		s.alertService.CreateIrrigationFailedAlert(schedule.ZoneID, "启动灌溉失败: "+err.Error())
 		return
@@ -159,6 +173,23 @@ func (s *IrrigationScheduler) runDeviceHealthCheck() {
 
 	for range ticker.C {
 		s.checkDeviceHealth()
+	}
+}
+
+// runReservationReaper 定期释放长时间未结算的预算预留，防止异常中断的灌溉占用额度
+func (s *IrrigationScheduler) runReservationReaper() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		released, err := s.budgetService.ReleaseStaleReservations(2 * time.Hour)
+		if err != nil {
+			logger.Error("Failed to release stale budget reservations", zap.Error(err))
+			continue
+		}
+		if released > 0 {
+			logger.Info("Released stale budget reservations", zap.Int64("count", released))
+		}
 	}
 }
 

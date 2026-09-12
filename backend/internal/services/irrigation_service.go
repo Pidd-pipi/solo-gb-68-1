@@ -1,7 +1,10 @@
 package services
 
 import (
+	"errors"
 	"time"
+
+	"gorm.io/gorm"
 
 	"irrigation/internal/models"
 	"irrigation/pkg/database"
@@ -13,7 +16,17 @@ func NewIrrigationService() *IrrigationService {
 	return &IrrigationService{}
 }
 
-func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, triggerType models.TriggerType) (*models.IrrigationLog, error) {
+// StartIrrigation 触发灌溉。触发前在事务内检查区域用水预算：
+//   - 超过月度上限：返回 ErrBudgetExceeded，事务回滚，不产生灌溉记录；
+//   - 达到告警阈值：正常触发，同时创建告警提醒；
+//   - 预算检查与预留在同一事务的预算行锁内完成，同一区域并发触发不会重复扣减预算。
+//
+// estimatedUsage 为本次灌溉预估用水（用于超限预判与并发预留），未知时传 0。
+func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, triggerType models.TriggerType, estimatedUsage float64) (*models.IrrigationLog, error) {
+	if estimatedUsage < 0 {
+		estimatedUsage = 0
+	}
+
 	log := &models.IrrigationLog{
 		ScheduleID:  scheduleID,
 		ZoneID:      zoneID,
@@ -22,8 +35,39 @@ func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, trig
 		Status:      models.ExecutionStatusInProgress,
 	}
 
-	if err := database.DB.Create(log).Error; err != nil {
+	budgetService := NewBudgetService()
+	var check *BudgetCheckResult
+
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if zoneID != nil {
+			result, err := budgetService.CheckBudget(tx, *zoneID, estimatedUsage)
+			if err != nil {
+				return err
+			}
+			check = result
+
+			if err := tx.Create(log).Error; err != nil {
+				return err
+			}
+
+			if result.Budget != nil && estimatedUsage > 0 {
+				if err := budgetService.CreateReservation(tx, result.Budget.ID, log.ID, *zoneID, estimatedUsage); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return tx.Create(log).Error
+	})
+	if err != nil {
+		if errors.Is(err, ErrBudgetExceeded) && zoneID != nil {
+			budgetService.NotifyExceeded(*zoneID, err.Error())
+		}
 		return nil, err
+	}
+
+	if check != nil && check.ThresholdReached && check.Budget != nil && zoneID != nil {
+		budgetService.NotifyThresholdReached(*zoneID, check)
 	}
 
 	return log, nil
@@ -48,9 +92,29 @@ func (s *IrrigationService) CompleteIrrigation(logID uint, success bool, waterUs
 		updates["water_usage"] = *waterUsage
 	}
 
-	return database.DB.Model(&models.IrrigationLog{}).
-		Where("id = ?", logID).
-		Updates(updates).Error
+	budgetService := NewBudgetService()
+
+	return database.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁定区域预算行，与 StartIrrigation 的预算检查串行化，保证用量统计口径一致
+		var log models.IrrigationLog
+		if err := tx.Select("id", "zone_id").First(&log, logID).Error; err != nil {
+			return err
+		}
+		if log.ZoneID != nil {
+			if _, err := budgetService.lockActiveBudget(tx, *log.ZoneID); err != nil {
+				return err
+			}
+		}
+
+		if err := tx.Model(&models.IrrigationLog{}).
+			Where("id = ?", logID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+
+		// 结算本次灌溉的预算预留（幂等）
+		return budgetService.SettleReservation(tx, logID, success)
+	})
 }
 
 func (s *IrrigationService) GetIrrigationHistory(zoneID *uint, startTime, endTime time.Time, limit int) ([]models.IrrigationLog, error) {
@@ -112,21 +176,21 @@ type ZoneWaterUsage struct {
 
 func (s *IrrigationService) GetZoneWaterUsage(startTime, endTime time.Time) ([]ZoneWaterUsage, error) {
 	var zoneUsages []ZoneWaterUsage
-	
+
 	query := `
-		SELECT 
+		SELECT
 			z.id as zone_id,
 			z.name as zone_name,
 			COALESCE(SUM(il.water_usage), 0) as water_usage
 		FROM irrigation_zones z
-		LEFT JOIN irrigation_logs il ON z.id = il.zone_id 
+		LEFT JOIN irrigation_logs il ON z.id = il.zone_id
 			AND il.status = 'success'
-			AND il.start_time >= ? 
+			AND il.start_time >= ?
 			AND il.start_time <= ?
 		GROUP BY z.id, z.name
 		ORDER BY water_usage DESC
 	`
-	
+
 	err := database.DB.Raw(query, startTime, endTime).Scan(&zoneUsages).Error
 	if err != nil {
 		return nil, err

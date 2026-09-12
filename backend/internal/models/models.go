@@ -134,6 +134,8 @@ const (
 	AlertTypeDeviceOffline   AlertType = "device_offline"
 	AlertTypeSensorAbnormal AlertType = "sensor_abnormal"
 	AlertTypeIrrigationFailed AlertType = "irrigation_failed"
+	AlertTypeBudgetThreshold AlertType = "budget_threshold"
+	AlertTypeBudgetExceeded  AlertType = "budget_exceeded"
 )
 
 type AlertLevel string
@@ -159,6 +161,7 @@ type Alert struct {
 	Title          string        `json:"title" gorm:"size:200;not null"`
 	Message        string        `json:"message" gorm:"type:text"`
 	DeviceID       *uint         `json:"device_id"`
+	ZoneID         *uint         `json:"zone_id"`
 	Status         AlertStatus   `json:"status" gorm:"type:alert_status;default:'new'"`
 	AcknowledgedAt *time.Time    `json:"acknowledged_at"`
 	ResolvedAt   *time.Time    `json:"resolved_at"`
@@ -181,4 +184,47 @@ type SystemConfig struct {
 	Description string    `json:"description" gorm:"type:text"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type BudgetStatus string
+
+const (
+	BudgetStatusActive   BudgetStatus = "active"
+	BudgetStatusInactive BudgetStatus = "inactive"
+)
+
+// WaterBudget 灌溉区域月度用水预算
+type WaterBudget struct {
+	ID             uint            `json:"id" gorm:"primaryKey"`
+	ZoneID         uint            `json:"zone_id" gorm:"not null;index"`
+	Zone           *IrrigationZone `json:"zone,omitempty" gorm:"foreignKey:ZoneID"`
+	MonthlyLimit   float64         `json:"monthly_limit" gorm:"type:decimal(12,2);not null"`
+	AlertThreshold float64         `json:"alert_threshold" gorm:"type:decimal(5,2);not null;default:80"`
+	Status         BudgetStatus    `json:"status" gorm:"type:budget_status;default:'active'"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+	DeletedAt      gorm.DeletedAt  `json:"-" gorm:"index"`
+}
+
+type ReservationStatus string
+
+const (
+	ReservationStatusReserved ReservationStatus = "reserved"
+	ReservationStatusSettled  ReservationStatus = "settled"
+	ReservationStatusReleased ReservationStatus = "released"
+)
+
+// WaterBudgetReservation 灌溉触发时的用水预留记录。
+// 触发灌溉时在预算行锁内创建，保证同一区域并发触发不会重复扣减预算；
+// 灌溉完成时结算（settled），失败或超时未结算时释放（released）。
+type WaterBudgetReservation struct {
+	ID        uint              `json:"id" gorm:"primaryKey"`
+	BudgetID  uint              `json:"budget_id" gorm:"not null;index"`
+	LogID     uint              `json:"log_id" gorm:"not null;uniqueIndex"`
+	ZoneID    uint              `json:"zone_id" gorm:"not null;index"`
+	Amount    float64           `json:"amount" gorm:"type:decimal(12,2);not null;default:0"`
+	Period    string            `json:"period" gorm:"size:7;not null;index"`
+	Status    ReservationStatus `json:"status" gorm:"type:reservation_status;default:'reserved'"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
 }
