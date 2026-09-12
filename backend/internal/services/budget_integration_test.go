@@ -383,6 +383,57 @@ func TestBudgetConcurrentTriggersWithoutEstimate(t *testing.T) {
 	}
 }
 
+func TestBudgetConcurrentTriggersWithTinyEstimate(t *testing.T) {
+	setupIntegrationDB(t)
+	irrigationSvc := NewIrrigationService()
+	zone := mustCreateZone(t, "极小预估用水区")
+	budget := mustCreateBudget(t, zone.ID, 50, 80)
+
+	// 10 个并发触发均传入极小正数预估用水：应按最小预留额度 10 扣减，
+	// 上限 50 仅允许 5 个通过，其余必须被拦截，预算保护不被绕过
+	const workers = 10
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := irrigationSvc.StartIrrigation(nil, &zone.ID, models.TriggerTypeManual, 0.0001)
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var succeeded, blocked, other int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrBudgetExceeded):
+			blocked++
+		default:
+			other++
+			t.Errorf("非预期错误: %v", err)
+		}
+	}
+	if other > 0 {
+		t.Fatalf("存在 %d 个非预期错误", other)
+	}
+	if succeeded != 5 || blocked != 5 {
+		t.Errorf("极小预估用水时并发扣减不正确：成功 %d（期望 5），拦截 %d（期望 5）", succeeded, blocked)
+	}
+
+	// 预算应被占满：预留 5*10=50，剩余 0
+	usage, err := NewBudgetService().GetBudgetUsage(budget.ID)
+	if err != nil {
+		t.Fatalf("查询用量失败: %v", err)
+	}
+	if usage.ReservedAmount != 50 || usage.RemainingAmount != 0 {
+		t.Errorf("极小预估用水时预算未被足额占用: %+v", usage)
+	}
+}
+
 func TestBudgetConcurrentCreate(t *testing.T) {
 	setupIntegrationDB(t)
 	svc := NewBudgetService()

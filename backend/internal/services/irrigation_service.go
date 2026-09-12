@@ -13,12 +13,23 @@ import (
 type IrrigationService struct{}
 
 // DefaultEstimatedWaterUsage 触发灌溉未提供预估用水量时使用的默认预估值，
-// 保证所有触发（包括未带预估用水的手动灌溉）都占用预算额度，
+// 同时作为单次触发的最小预留额度：预估用水低于该值（含极小正数、0 或负数）
+// 时一律按该值占用预算，保证所有触发（包括手动灌溉）都占用合理预算额度，
 // 同一区域并发触发时预算不会被绕过。
 const DefaultEstimatedWaterUsage = 10.0
 
 func NewIrrigationService() *IrrigationService {
 	return &IrrigationService{}
+}
+
+// normalizeEstimatedUsage 将预估用水量规整为不低于 DefaultEstimatedWaterUsage。
+// 极小正数预估（如 0.0001）会使每次触发只占用极少额度，同一区域并发触发时
+// 预算检查形同虚设，因此偏小的预估也按默认额度兜底。
+func normalizeEstimatedUsage(estimatedUsage float64) float64 {
+	if estimatedUsage < DefaultEstimatedWaterUsage {
+		return DefaultEstimatedWaterUsage
+	}
+	return estimatedUsage
 }
 
 // StartIrrigation 触发灌溉。触发前在事务内检查区域用水预算：
@@ -27,11 +38,10 @@ func NewIrrigationService() *IrrigationService {
 //   - 预算检查与预留在同一事务的预算行锁内完成，同一区域并发触发不会重复扣减预算。
 //
 // estimatedUsage 为本次灌溉预估用水（用于超限预判与并发预留）；
-// 小于等于 0 时按 DefaultEstimatedWaterUsage 兜底，确保触发总是占用预算额度。
+// 低于 DefaultEstimatedWaterUsage（含极小正数、0 或负数）时按默认值兜底，
+// 确保触发总是占用合理预算额度。
 func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, triggerType models.TriggerType, estimatedUsage float64) (*models.IrrigationLog, error) {
-	if estimatedUsage <= 0 {
-		estimatedUsage = DefaultEstimatedWaterUsage
-	}
+	estimatedUsage = normalizeEstimatedUsage(estimatedUsage)
 
 	log := &models.IrrigationLog{
 		ScheduleID:  scheduleID,
@@ -56,7 +66,7 @@ func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, trig
 				return err
 			}
 
-			// 有启用预算时始终创建预留（预估量已兜底为正数），
+			// 有启用预算时始终创建预留（预估量已兜底为不低于默认值的额度），
 			// 并发触发在预算行锁内串行扣减，不会绕过预算
 			if result.Budget != nil {
 				if err := budgetService.CreateReservation(tx, result.Budget.ID, log.ID, *zoneID, estimatedUsage); err != nil {
