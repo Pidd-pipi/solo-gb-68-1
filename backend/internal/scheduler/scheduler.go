@@ -65,11 +65,11 @@ func (s *IrrigationScheduler) executeScheduleIfNeeded(schedule models.Irrigation
 
 	if schedule.Type == models.ScheduleTypeTimed {
 		if shouldExecuteTimedSchedule(schedule, now) {
-			go s.executeIrrigation(schedule)
+			go s.ExecuteIrrigation(schedule)
 		}
 	} else if schedule.Type == models.ScheduleTypeConditional {
 		if shouldExecuteConditionalSchedule(schedule) {
-			go s.executeIrrigation(schedule)
+			go s.ExecuteIrrigation(schedule)
 		}
 	}
 }
@@ -120,7 +120,10 @@ func shouldExecuteConditionalSchedule(schedule models.IrrigationSchedule) bool {
 	return *avgHumidity < *schedule.HumidityThreshold
 }
 
-func (s *IrrigationScheduler) executeIrrigation(schedule models.IrrigationSchedule) {
+// ExecuteIrrigation 同步执行一次灌溉计划：预估用水（duration * 0.1）经预算检查后触发，
+// 预算超限时仅记录日志不产生灌溉记录。调度循环以 goroutine 方式调用，
+// 测试可同步调用以确定性验证自动调度触发路径。
+func (s *IrrigationScheduler) ExecuteIrrigation(schedule models.IrrigationSchedule) {
 	logger.Info("Executing irrigation schedule", zap.Uint("schedule_id", schedule.ID))
 
 	if schedule.RainSensorID != nil {
