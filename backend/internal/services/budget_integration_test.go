@@ -332,6 +332,100 @@ func TestBudgetConcurrentTriggers(t *testing.T) {
 	}
 }
 
+func TestBudgetConcurrentTriggersWithoutEstimate(t *testing.T) {
+	setupIntegrationDB(t)
+	irrigationSvc := NewIrrigationService()
+	zone := mustCreateZone(t, "无预估用水区")
+	budget := mustCreateBudget(t, zone.ID, 50, 80)
+
+	// 10 个并发触发均不带预估用水：按默认预估值 10 扣减，
+	// 上限 50 仅允许 5 个通过，其余必须被拦截
+	const workers = 10
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := irrigationSvc.StartIrrigation(nil, &zone.ID, models.TriggerTypeManual, 0)
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var succeeded, blocked, other int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrBudgetExceeded):
+			blocked++
+		default:
+			other++
+			t.Errorf("非预期错误: %v", err)
+		}
+	}
+	if other > 0 {
+		t.Fatalf("存在 %d 个非预期错误", other)
+	}
+	if succeeded != 5 || blocked != 5 {
+		t.Errorf("无预估用水时并发扣减不正确：成功 %d（期望 5），拦截 %d（期望 5）", succeeded, blocked)
+	}
+
+	// 预算应被占满：预留 5*10=50，剩余 0
+	usage, err := NewBudgetService().GetBudgetUsage(budget.ID)
+	if err != nil {
+		t.Fatalf("查询用量失败: %v", err)
+	}
+	if usage.ReservedAmount != 50 || usage.RemainingAmount != 0 {
+		t.Errorf("无预估用水时预算未被占用: %+v", usage)
+	}
+}
+
+func TestBudgetConcurrentCreate(t *testing.T) {
+	setupIntegrationDB(t)
+	svc := NewBudgetService()
+	zone := mustCreateZone(t, "并发预算区")
+
+	// 并发创建同一区域的首条启用预算：仅 1 个成功，其余稳定返回 ErrBudgetExists（HTTP 409）
+	const workers = 5
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- svc.CreateBudget(&models.WaterBudget{
+				ZoneID:         zone.ID,
+				MonthlyLimit:   100,
+				AlertThreshold: 80,
+			})
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var succeeded, conflicts, other int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrBudgetExists):
+			conflicts++
+		default:
+			other++
+			t.Errorf("非预期错误（应稳定返回 ErrBudgetExists）: %v", err)
+		}
+	}
+	if other > 0 {
+		t.Fatalf("存在 %d 个非预期错误", other)
+	}
+	if succeeded != 1 || conflicts != workers-1 {
+		t.Errorf("并发创建预算不正确：成功 %d（期望 1），冲突 %d（期望 %d）", succeeded, conflicts, workers-1)
+	}
+}
+
 func TestReservationSettleAndRelease(t *testing.T) {
 	setupIntegrationDB(t)
 	irrigationSvc := NewIrrigationService()

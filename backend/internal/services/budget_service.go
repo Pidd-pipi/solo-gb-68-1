@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -25,6 +26,14 @@ type BudgetService struct{}
 
 func NewBudgetService() *BudgetService {
 	return &BudgetService{}
+}
+
+// isUniqueViolation 判断是否为 PostgreSQL 唯一约束冲突（SQLSTATE 23505）。
+// 并发创建/启用同一区域的预算时，未通过"已存在"预检的请求会撞上
+// idx_water_budgets_zone_active 部分唯一索引，需稳定映射为 ErrBudgetExists。
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // ---------- 纯函数：预算判定与用量计算（便于单元测试） ----------
@@ -92,7 +101,15 @@ func (s *BudgetService) CreateBudget(budget *models.WaterBudget) error {
 	}
 
 	budget.Status = models.BudgetStatusActive
-	return database.DB.Create(budget).Error
+	if err := database.DB.Create(budget).Error; err != nil {
+		// 并发创建同一区域的首条启用预算时，预检与插入之间存在竞争窗口，
+		// 撞上唯一索引的请求统一返回 ErrBudgetExists（HTTP 409）
+		if isUniqueViolation(err) {
+			return ErrBudgetExists
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *BudgetService) GetBudgetByID(id uint) (*models.WaterBudget, error) {
@@ -181,9 +198,16 @@ func (s *BudgetService) EnableBudget(id uint) error {
 		return ErrBudgetExists
 	}
 
-	return database.DB.Model(&models.WaterBudget{}).
+	// 并发启用同一区域的多个预算时同样依赖唯一索引兜底
+	if err := database.DB.Model(&models.WaterBudget{}).
 		Where("id = ?", id).
-		Update("status", models.BudgetStatusActive).Error
+		Update("status", models.BudgetStatusActive).Error; err != nil {
+		if isUniqueViolation(err) {
+			return ErrBudgetExists
+		}
+		return err
+	}
+	return nil
 }
 
 // ---------- 实时用量 ----------

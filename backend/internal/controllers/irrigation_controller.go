@@ -25,12 +25,12 @@ func NewIrrigationController() *IrrigationController {
 
 // ManualIrrigate godoc
 // @Summary 手动灌溉
-// @Description 触发手动灌溉。触发前检查区域用水预算：达到告警阈值时返回告警提醒；超过月度上限时拦截（409），不产生灌溉记录
+// @Description 触发手动灌溉。触发前检查区域用水预算：达到告警阈值时返回告警提醒；超过月度上限时拦截（409），不产生灌溉记录。未提供预估用水量时按默认值预留额度，并发触发同样受预算约束
 // @Tags 灌溉执行
 // @Security ApiKeyAuth
 // @Accept json
 // @Produce json
-// @Param request body object{zone_id=int,estimated_usage=float64} true "区域ID与预估用水量（可选）"
+// @Param request body object{zone_id=int,estimated_usage=float64} true "区域ID与预估用水量（可选，缺省按默认值预留）"
 // @Success 200 {object} models.IrrigationLog
 // @Failure 409 {object} response.Response "超过用水预算上限"
 // @Router /api/irrigation/manual [post]

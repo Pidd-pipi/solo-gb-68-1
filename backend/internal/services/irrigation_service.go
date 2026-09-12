@@ -12,6 +12,11 @@ import (
 
 type IrrigationService struct{}
 
+// DefaultEstimatedWaterUsage 触发灌溉未提供预估用水量时使用的默认预估值，
+// 保证所有触发（包括未带预估用水的手动灌溉）都占用预算额度，
+// 同一区域并发触发时预算不会被绕过。
+const DefaultEstimatedWaterUsage = 10.0
+
 func NewIrrigationService() *IrrigationService {
 	return &IrrigationService{}
 }
@@ -21,10 +26,11 @@ func NewIrrigationService() *IrrigationService {
 //   - 达到告警阈值：正常触发，同时创建告警提醒；
 //   - 预算检查与预留在同一事务的预算行锁内完成，同一区域并发触发不会重复扣减预算。
 //
-// estimatedUsage 为本次灌溉预估用水（用于超限预判与并发预留），未知时传 0。
+// estimatedUsage 为本次灌溉预估用水（用于超限预判与并发预留）；
+// 小于等于 0 时按 DefaultEstimatedWaterUsage 兜底，确保触发总是占用预算额度。
 func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, triggerType models.TriggerType, estimatedUsage float64) (*models.IrrigationLog, error) {
-	if estimatedUsage < 0 {
-		estimatedUsage = 0
+	if estimatedUsage <= 0 {
+		estimatedUsage = DefaultEstimatedWaterUsage
 	}
 
 	log := &models.IrrigationLog{
@@ -50,7 +56,9 @@ func (s *IrrigationService) StartIrrigation(scheduleID *uint, zoneID *uint, trig
 				return err
 			}
 
-			if result.Budget != nil && estimatedUsage > 0 {
+			// 有启用预算时始终创建预留（预估量已兜底为正数），
+			// 并发触发在预算行锁内串行扣减，不会绕过预算
+			if result.Budget != nil {
 				if err := budgetService.CreateReservation(tx, result.Budget.ID, log.ID, *zoneID, estimatedUsage); err != nil {
 					return err
 				}
@@ -142,9 +150,9 @@ func (s *IrrigationService) GetIrrigationHistory(zoneID *uint, startTime, endTim
 }
 
 type WaterUsageStats struct {
-	TotalUsage   float64 `json:"total_usage"`
-	Duration     int64   `json:"duration"`
-	IrrigationCount int64 `json:"irrigation_count"`
+	TotalUsage      float64 `json:"total_usage"`
+	Duration        int64   `json:"duration"`
+	IrrigationCount int64   `json:"irrigation_count"`
 }
 
 func (s *IrrigationService) GetWaterUsageStats(zoneID *uint, startTime, endTime time.Time) (*WaterUsageStats, error) {
